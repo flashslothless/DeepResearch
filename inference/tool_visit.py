@@ -1,256 +1,165 @@
 import json
 import os
-import signal
-import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import List, Union
+from typing import List, Union, Optional
 import requests
 from qwen_agent.tools.base import BaseTool, register_tool
-from prompt import EXTRACTOR_PROMPT 
-from openai import OpenAI
-import random
-from urllib.parse import urlparse, unquote
-import time 
-from transformers import AutoTokenizer
-import tiktoken
-
-VISIT_SERVER_TIMEOUT = int(os.getenv("VISIT_SERVER_TIMEOUT", 200))
-WEBCONTENT_MAXLENGTH = int(os.getenv("WEBCONTENT_MAXLENGTH", 150000))
-
-JINA_API_KEYS = os.getenv("JINA_API_KEYS", "")
 
 
-@staticmethod
-def truncate_to_tokens(text: str, max_tokens: int = 95000) -> str:
-    encoding = tiktoken.get_encoding("cl100k_base")
-    
-    tokens = encoding.encode(text)
-    if len(tokens) <= max_tokens:
-        return text
-    
-    truncated_tokens = tokens[:max_tokens]
-    return encoding.decode(truncated_tokens)
-
-OSS_JSON_FORMAT = """# Response Formats
-## visit_content
-{"properties":{"rational":{"type":"string","description":"Locate the **specific sections/data** directly related to the user's goal within the webpage content"},"evidence":{"type":"string","description":"Identify and extract the **most relevant information** from the content, never miss any important information, output the **full original context** of the content as far as possible, it can be more than three paragraphs.","summary":{"type":"string","description":"Organize into a concise paragraph with logical flow, prioritizing clarity and judge the contribution of the information to the goal."}}}}"""
+TAVILY_API_KEY = os.environ.get('TAVILY_API_KEY')
+TAVILY_EXTRACT_URL = "https://api.tavily.com/extract"
 
 
-@register_tool('visit', allow_overwrite=True)
+@register_tool("visit", allow_overwrite=True)
 class Visit(BaseTool):
-    # The `description` tells the agent the functionality of this tool.
     name = 'visit'
-    description = 'Visit webpage(s) and return the summary of the content.'
-    # The `parameters` tell the agent what input parameters the tool has.
+    description = 'Visit webpage(s) and return the content. Uses Tavily extract API.'
     parameters = {
         "type": "object",
         "properties": {
             "url": {
                 "type": ["string", "array"],
-                "items": {
-                    "type": "string"
-                    },
-                "minItems": 1,
+                "items": {"type": "string"},
                 "description": "The URL(s) of the webpage(s) to visit. Can be a single URL or an array of URLs."
-        },
-        "goal": {
+            },
+            "goal": {
                 "type": "string",
-                "description": "The goal of the visit for webpage(s)."
-        }
+                "description": "The specific information goal for visiting webpage(s)."
+            }
         },
         "required": ["url", "goal"]
     }
-    # The `call` method is the main function of the tool.
-    def call(self, params: Union[str, dict], **kwargs) -> str:
-        try:
-            url = params["url"]
-            goal = params["goal"]
-        except:
-            return "[Visit] Invalid request format: Input must be a JSON object containing 'url' and 'goal' fields"
 
-        start_time = time.time()
-        
-        # Create log folder if it doesn't exist
-        log_folder = "log"
-        os.makedirs(log_folder, exist_ok=True)
+    def __init__(self, cfg: Optional[dict] = None):
+        super().__init__(cfg)
 
-        if isinstance(url, str):
-            response = self.readpage_jina(url, goal)
-        else:
-            response = []
-            assert isinstance(url, List)
-            start_time = time.time()
-            for u in url: 
-                if time.time() - start_time > 900:
-                    cur_response = "The useful information in {url} for user goal {goal} as follows: \n\n".format(url=url, goal=goal)
-                    cur_response += "Evidence in page: \n" + "The provided webpage content could not be accessed. Please check the URL or file format." + "\n\n"
-                    cur_response += "Summary: \n" + "The webpage content could not be processed, and therefore, no information is available." + "\n\n"
-                else:
-                    try:
-                        cur_response = self.readpage_jina(u, goal)
-                    except Exception as e:
-                        cur_response = f"Error fetching {u}: {str(e)}"
-                response.append(cur_response)
-            response = "\n=======\n".join(response)
-        
-        print(f'Summary Length {len(response)}; Summary Content {response}')
-        return response.strip()
-        
-    def call_server(self, msgs, max_retries=2):
-        api_key = os.environ.get("API_KEY")
-        url_llm = os.environ.get("API_BASE")
-        model_name = os.environ.get("SUMMARY_MODEL_NAME", "")
-        client = OpenAI(
-            api_key=api_key,
-            base_url=url_llm,
-        )
-        for attempt in range(max_retries):
-            try:
-                chat_response = client.chat.completions.create(
-                    model=model_name,
-                    messages=msgs,
-                    temperature=0.7
-                )
-                content = chat_response.choices[0].message.content
-                if content:
-                    try:
-                        json.loads(content)
-                    except:
-                        # extract json from string 
-                        left = content.find('{')
-                        right = content.rfind('}') 
-                        if left != -1 and right != -1 and left <= right: 
-                            content = content[left:right+1]
-                    return content
-            except Exception as e:
-                # print(e)
-                if attempt == (max_retries - 1):
-                    return ""
-                continue
-
-
-    def jina_readpage(self, url: str) -> str:
+    def tavily_extract(self, urls: List[str], goal: str) -> str:
         """
-        Read webpage content using Jina service.
+        Extract content from URLs using Tavily extract API.
         
         Args:
-            url: The URL to read
-            goal: The goal/purpose of reading the page
+            urls: List of URLs to extract content from
+            goal: The user's goal for extraction (used for reranking)
             
         Returns:
-            str: The webpage content or error message
+            Extracted content as formatted string
         """
-        max_retries = 3
-        timeout = 50
+        if not TAVILY_API_KEY:
+            return "[Visit Error]: TAVILY_API_KEY environment variable not set."
         
-        for attempt in range(max_retries):
-            headers = {
-                "Authorization": f"Bearer {JINA_API_KEYS}",
-            }
+        headers = {
+            "Content-Type": "application/json"
+        }
+        
+        payload = {
+            "api_key": TAVILY_API_KEY,
+            "urls": urls,
+            "extract_depth": "basic",  # Use basic for faster response, can be "advanced"
+            "include_images": False
+        }
+        
+        for attempt in range(3):
             try:
-                response = requests.get(
-                    f"https://r.jina.ai/{url}",
+                response = requests.post(
+                    TAVILY_EXTRACT_URL,
                     headers=headers,
-                    timeout=timeout
+                    json=payload,
+                    timeout=60
                 )
-                if response.status_code == 200:
-                    webpage_content = response.text
-                    return webpage_content
-                else:
-                    print(response.text)
-                    raise ValueError("jina readpage error")
-            except Exception as e:
-                time.sleep(0.5)
-                if attempt == max_retries - 1:
-                    return "[visit] Failed to read page."
+                response.raise_for_status()
+                results = response.json()
                 
-        return "[visit] Failed to read page."
+                return self._format_extract_results(results, goal)
+                
+            except requests.exceptions.Timeout:
+                if attempt == 2:
+                    return f"[Visit Error]: Timeout while extracting content from URLs."
+                continue
+            except requests.exceptions.RequestException as e:
+                if attempt == 2:
+                    return f"[Visit Error]: Failed to extract content: {str(e)}"
+                continue
+            except Exception as e:
+                return f"[Visit Error]: Unexpected error: {str(e)}"
+        
+        return "[Visit Error]: All attempts failed."
 
-    def html_readpage_jina(self, url: str) -> str:
-        max_attempts = 8
-        for attempt in range(max_attempts):
-            content = self.jina_readpage(url)
-            service = "jina"     
-            print(service)
-            if content and not content.startswith("[visit] Failed to read page.") and content != "[visit] Empty content." and not content.startswith("[document_parser]"):
-                return content
-        return "[visit] Failed to read page."
-
-    def readpage_jina(self, url: str, goal: str) -> str:
+    def _format_extract_results(self, results: dict, goal: str) -> str:
         """
-        Attempt to read webpage content by alternating between jina and aidata services.
+        Format Tavily extract API results into a readable string.
         
         Args:
-            url: The URL to read
-            goal: The goal/purpose of reading the page
+            results: The JSON response from Tavily extract API
+            goal: The user's goal for context
             
         Returns:
-            str: The webpage content or error message
+            Formatted string with extracted content
         """
-   
-        summary_page_func = self.call_server
-        max_retries = int(os.getenv('VISIT_SERVER_MAX_RETRIES', 1))
-
-        content = self.html_readpage_jina(url)
-
-        if content and not content.startswith("[visit] Failed to read page.") and content != "[visit] Empty content." and not content.startswith("[document_parser]"):
-            content = truncate_to_tokens(content, max_tokens=95000)
-            messages = [{"role":"user","content": EXTRACTOR_PROMPT.format(webpage_content=content, goal=goal)}]
-            parse_retry_times = 0
-            raw = summary_page_func(messages, max_retries=max_retries)
-            summary_retries = 3
-            while len(raw) < 10 and summary_retries >= 0:
-                truncate_length = int(0.7 * len(content)) if summary_retries > 0 else 25000
-                status_msg = (
-                    f"[visit] Summary url[{url}] " 
-                    f"attempt {3 - summary_retries + 1}/3, "
-                    f"content length: {len(content)}, "
-                    f"truncating to {truncate_length} chars"
-                ) if summary_retries > 0 else (
-                    f"[visit] Summary url[{url}] failed after 3 attempts, "
-                    f"final truncation to 25000 chars"
-                )
-                print(status_msg)
-                content = content[:truncate_length]
-                extraction_prompt = EXTRACTOR_PROMPT.format(
-                    webpage_content=content,
-                    goal=goal
-                )
-                messages = [{"role": "user", "content": extraction_prompt}]
-                raw = summary_page_func(messages, max_retries=max_retries)
-                summary_retries -= 1
-
-            parse_retry_times = 2
-            if isinstance(raw, str):
-                raw = raw.replace("```json", "").replace("```", "").strip()
-            while parse_retry_times < 3:
-                try:
-                    raw = json.loads(raw)
-                    break
-                except:
-                    raw = summary_page_func(messages, max_retries=max_retries)
-                    parse_retry_times += 1
+        output_parts = []
+        
+        # Process successful extractions
+        extracted_results = results.get("results", [])
+        failed_results = results.get("failed_results", [])
+        
+        if not extracted_results and failed_results:
+            failed_urls = [f.get("url", "unknown") for f in failed_results]
+            return f"[Visit Error]: Failed to extract content from: {', '.join(failed_urls)}"
+        
+        for result in extracted_results:
+            url = result.get("url", "Unknown URL")
+            raw_content = result.get("raw_content", "")
             
-            if parse_retry_times >= 3:
-                useful_information = "The useful information in {url} for user goal {goal} as follows: \n\n".format(url=url, goal=goal)
-                useful_information += "Evidence in page: \n" + "The provided webpage content could not be accessed. Please check the URL or file format." + "\n\n"
-                useful_information += "Summary: \n" + "The webpage content could not be processed, and therefore, no information is available." + "\n\n"
-            else:
-                useful_information = "The useful information in {url} for user goal {goal} as follows: \n\n".format(url=url, goal=goal)
-                useful_information += "Evidence in page: \n" + str(raw["evidence"]) + "\n\n"
-                useful_information += "Summary: \n" + str(raw["summary"]) + "\n\n"
-
-            if len(useful_information) < 10 and summary_retries < 0:
-                print("[visit] Could not generate valid summary after maximum retries")
-                useful_information = "[visit] Failed to read page"
+            # Truncate content if too long
+            max_content_length = 50000
+            if len(raw_content) > max_content_length:
+                raw_content = raw_content[:max_content_length] + "\n... [content truncated]"
             
-            return useful_information
+            output_parts.append(f"## Content from {url}\n\n{raw_content}")
+        
+        if not output_parts:
+            return "[Visit Error]: No content could be extracted from the provided URLs."
+        
+        # Add goal context
+        header = f"Extracted content for goal: {goal}\n\n"
+        return header + "\n\n---\n\n".join(output_parts)
 
-        # If no valid content was obtained after all retries
+    def call(self, params: Union[str, dict], **kwargs) -> str:
+        """
+        Execute the visit tool.
+        
+        Args:
+            params: Either a JSON string or dict containing 'url' and 'goal' fields
+            
+        Returns:
+            Extracted webpage content as a formatted string
+        """
+        try:
+            if isinstance(params, str):
+                params = json.loads(params)
+            
+            # Handle nested params structure
+            if "params" in params:
+                params = params["params"]
+            
+            url = params.get("url", [])
+            goal = params.get("goal", "Extract relevant information")
+        except Exception as e:
+            return f"[Visit] Invalid request format: {str(e)}"
+        
+        if not url:
+            return "[Visit] Error: No URL provided"
+        
+        # Normalize url to list
+        if isinstance(url, str):
+            urls = [url]
         else:
-            useful_information = "The useful information in {url} for user goal {goal} as follows: \n\n".format(url=url, goal=goal)
-            useful_information += "Evidence in page: \n" + "The provided webpage content could not be accessed. Please check the URL or file format." + "\n\n"
-            useful_information += "Summary: \n" + "The webpage content could not be processed, and therefore, no information is available." + "\n\n"
-            return useful_information
-
-    
+            urls = url
+        
+        # Filter out invalid URLs
+        valid_urls = [u for u in urls if u.startswith(("http://", "https://"))]
+        
+        if not valid_urls:
+            return "[Visit] Error: No valid URLs provided (must start with http:// or https://)"
+        
+        print(f"[Visit] Extracting content from {len(valid_urls)} URL(s) using Tavily...")
+        
+        return self.tavily_extract(valid_urls, goal)

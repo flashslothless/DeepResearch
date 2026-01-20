@@ -17,9 +17,6 @@ from prompt import *
 import time
 import asyncio
 
-from tool_file import *
-from tool_scholar import *
-from tool_python import *
 from tool_search import *
 from tool_visit import *
 
@@ -28,12 +25,10 @@ OBS_END = '\n</tool_response>'
 
 MAX_LLM_CALL_PER_RUN = int(os.getenv('MAX_LLM_CALL_PER_RUN', 100))
 
+# Disabled tools: Scholar, PythonInterpreter, FileParser (requires cloud service)
 TOOL_CLASS = [
-    FileParser(),
-    Scholar(),
     Visit(),
     Search(),
-    PythonInterpreter(),
 ]
 TOOL_MAP = {tool.name: tool for tool in TOOL_CLASS}
 
@@ -56,10 +51,11 @@ class MultiTurnReactAgent(FnCallAgent):
     def sanity_check_output(self, content):
         return "<think>" in content and "</think>" in content
     
-    def call_server(self, msgs, planning_port, max_tries=10):
-        
-        openai_api_key = "EMPTY"
-        openai_api_base = f"http://127.0.0.1:{planning_port}/v1"
+    def call_server(self, msgs, planning_port=None, max_tries=10):
+        # Use OpenRouter API from environment variables
+        openai_api_key = os.environ.get('OPENAI_API_KEY', 'EMPTY')
+        openai_api_base = os.environ.get('OPENAI_BASE_URL', f'http://127.0.0.1:{planning_port}/v1')
+        self.model = os.environ.get('OPENAI_MODEL', self.model)
 
         client = OpenAI(
             api_key=openai_api_key,
@@ -83,9 +79,10 @@ class MultiTurnReactAgent(FnCallAgent):
                 )
                 content = chat_response.choices[0].message.content
 
-                # OpenRouter provides API calling. If you want to use OpenRouter, you need to uncomment line 89 - 90.
-                # reasoning_content = "<think>\n" + chat_response.choices[0].message.reasoning.strip() + "\n</think>"
-                # content = reasoning_content + content                
+                # OpenRouter: extract reasoning content if available
+                if hasattr(chat_response.choices[0].message, 'reasoning') and chat_response.choices[0].message.reasoning:
+                    reasoning_content = "<think>\n" + chat_response.choices[0].message.reasoning.strip() + "\n</think>"
+                    content = reasoning_content + content                
                 
                 if content and content.strip():
                     print("--- Service call successful, received a valid response ---")
@@ -110,12 +107,20 @@ class MultiTurnReactAgent(FnCallAgent):
         return f"vllm server error!!!"
 
     def count_tokens(self, messages):
-        tokenizer = AutoTokenizer.from_pretrained(self.llm_local_path) 
-        full_prompt = tokenizer.apply_chat_template(messages, tokenize=False)
-        tokens = tokenizer(full_prompt, return_tensors="pt")
-        token_count = len(tokens["input_ids"][0])
-        
-        return token_count
+        """Count tokens using tiktoken (cl100k_base encoding)."""
+        import tiktoken
+        try:
+            encoding = tiktoken.get_encoding("cl100k_base")
+            # Convert messages to text
+            text = ""
+            for msg in messages:
+                text += msg.get("role", "") + ": " + msg.get("content", "") + "\n"
+            token_count = len(encoding.encode(text))
+            return token_count
+        except Exception as e:
+            # Fallback to character-based estimation (4 chars ≈ 1 token)
+            text = str(messages)
+            return len(text) // 4
 
     def _run(self, data: str, model: str, **kwargs) -> List[List[Message]]:
         self.model=model

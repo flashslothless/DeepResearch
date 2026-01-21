@@ -1,4 +1,4 @@
-# DeepResearch
+# NanoDeepResearch
 
 A lightweight, practical **deep-research agent** that combines a **ReAct-style loop** with **web search + source visiting** to answer information-seeking questions with higher confidence.
 
